@@ -1,0 +1,255 @@
+import os
+import json
+import re
+import time
+import requests
+from github import Github, Auth
+
+gh_token = os.environ.get("GITHUB_TOKEN")
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
+repo_name = os.environ.get("REPOSITORY")
+event_name = os.environ.get("EVENT_NAME")
+allowed_users = [u.strip().lower() for u in os.environ.get("ALLOWED_USER", "").split(",")]
+
+print(f"[1/6] Authenticating with GitHub...")
+auth = Auth.Token(gh_token)
+gh = Github(auth=auth, timeout=30, retry=3)
+
+print(f"[2/6] Fetching repo: {repo_name}")
+repo = gh.get_repo(repo_name)
+
+diff_text = ""
+event_context = ""
+author_login = ""
+trigger_labels = []
+dedup_key = ""
+pr_ref = None
+
+print(f"[3/6] Processing event: {event_name}")
+if event_name == "push":
+    commit_sha = os.environ.get("COMMIT_SHA")
+    print(f"[3/6] Fetching commit: {commit_sha[:7]}")
+    commit = repo.get_commit(commit_sha)
+
+    if len(commit.parents) > 1:
+        print("Merge commit detected, skipping.")
+        exit(0)
+    if not commit.author:
+        print("No commit author, skipping.")
+        exit(0)
+
+    author_login = commit.author.login.strip().lower()
+    if author_login not in allowed_users:
+        print(f"Author '{author_login}' not in allowed users, skipping.")
+        exit(0)
+
+    dedup_key = f"commit:{commit_sha[:7]}"
+    event_context = f"Commit Message: {commit.commit.message}"
+    trigger_labels = [m.lower() for m in re.findall(r'\[(.*?)\]', commit.commit.message)]
+    print(f"[3/6] Labels detected: {trigger_labels}")
+
+    for file in commit.files:
+        diff_text += f"File: {file.filename}\nPatch:\n{file.patch}\n\n"
+        if len(diff_text) > 10000:
+            diff_text += "\n[Diff truncated...]"
+            break
+
+elif event_name == "pull_request":
+    pr_number = int(os.environ.get("PR_NUMBER"))
+    print(f"[3/6] Fetching PR: #{pr_number}")
+    pr = repo.get_pull(pr_number)
+    author_login = pr.user.login.strip().lower()
+    if author_login not in allowed_users:
+        print(f"Author '{author_login}' not in allowed users, skipping.")
+        exit(0)
+
+    pr_ref = pr
+    dedup_key = f"PR #{pr_number}"
+    event_context = f"PR Title: {pr.title}\nPR Body: {pr.body}"
+    trigger_labels = [label.name.lower() for label in pr.labels]
+    print(f"[3/6] Labels detected: {trigger_labels}")
+
+    for file in pr.get_files():
+        diff_text += f"File: {file.filename}\nPatch:\n{file.patch}\n\n"
+        if len(diff_text) > 80000:
+            diff_text += "\n[Diff truncated...]"
+            break
+else:
+    print(f"Unknown event '{event_name}', skipping.")
+    exit(0)
+
+print(f"[4/6] Diff size: {len(diff_text)} chars")
+if len(diff_text.strip()) < 50:
+    print("Diff too small to analyze. Skipping.")
+    exit(0)
+
+print(f"[4/6] Checking for duplicate open issues...")
+for issue in repo.get_issues(state="open"):
+    if dedup_key in (issue.body or ""):
+        print(f"Issue for {dedup_key} already exists (#{issue.number}), skipping.")
+        exit(0)
+
+def was_already_closed(title_keyword: str) -> bool:
+    for issue in repo.get_issues(state="closed"):
+        if title_keyword.lower() in (issue.title or "").lower():
+            print(f"Similar closed issue found: #{issue.number} — skipping.")
+            return True
+    return False
+
+def build_permalink(filename: str, line: int = 1) -> str:
+    sha = os.environ.get("COMMIT_SHA") or ""
+    if not sha and pr_ref:
+        sha = pr_ref.head.sha
+    return f"https://github.com/{repo_name}/blob/{sha}/{filename}#L{line}"
+
+base_instructions = """
+Return only a raw JSON object with no markdown formatting. The JSON must have these exact keys:
+
+"issue_title": string — include severity prefix like [CRITICAL], [HIGH], [MEDIUM], or [LOW] at the start,
+"severity": string — one of: critical, high, medium, low,
+"issue_body": string — must include these sections:
+  ## Problem
+  (clear description with exact file paths and line numbers if known)
+
+  ## Code Reference
+  (the exact problematic code snippet)
+
+  ## Suggested Fix
+  (concrete code or steps to fix)
+
+  ## Permalink
+  (placeholder: PUT_PERMALINK_HERE — will be replaced automatically)
+
+"labels": list of strings — standard GitHub labels plus the severity level,
+"affected_file": string — the most relevant filename from the diff (or "" if unknown),
+"affected_line": integer — approximate line number of the issue (or 1 if unknown),
+"summary": string — 2-3 sentence plain-English summary for the PR comment
+
+The issue_title, issue_body and summary MUST be written entirely in English.
+"""
+
+if any(l in trigger_labels for l in ["sec", "security", "audit"]):
+    prompt = f"Act as a Strict Security Auditor. Perform a deep security audit (OWASP Top 10). Find real vulnerabilities with exact file/line references.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["review", "refactor", "code-review"]):
+    prompt = f"Act as a Strict Code Reviewer. Analyze code quality (SOLID/DRY). Point to exact lines that violate principles.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["qa", "test", "testing"]):
+    prompt = f"Act as a QA Engineer. Identify edge cases and missing test coverage. Reference exact functions/lines.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["perf", "performance", "optimize"]):
+    prompt = f"Act as a Performance Expert. Analyze bottlenecks and O(n) complexity issues with exact line references.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["pm", "release", "product"]):
+    prompt = f"Act as a Product Manager. Generate user-facing Release Notes with clear impact descriptions.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["deps", "dependencies"]):
+    prompt = f"Act as a Security & Dependency Auditor. Analyze all new or changed dependencies: check for known vulnerabilities (CVEs), license compatibility (MIT/Apache/GPL), package size impact, and whether each dep is actively maintained. Reference exact file and line where dep is added.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["arch", "architecture"]):
+    prompt = f"Act as a Software Architect. Review the code changes for architectural issues: violation of separation of concerns, tight coupling, wrong layer dependencies, anti-patterns (God object, spaghetti logic, magic numbers). Reference exact files and lines.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+else:
+    prompt = f"""Analyze the following code changes and create a documentation issue summarizing what was changed and why.
+IMPORTANT: Do NOT invent security issues, bugs, or problems that do not exist in the diff.
+If the changes are trivial (e.g. adding imports, minor refactoring), set severity to LOW and describe only what actually changed.
+Context: {event_context}
+Changes: {diff_text}
+{base_instructions}"""
+
+print(f"[5/6] Calling Gemini API...")
+def call_gemini(prompt: str, retries: int = 4, base_delay: int = 15) -> dict:
+    headers = {"Content-Type": "application/json"}
+    models_to_try = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+    ]
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": "You are a professional software auditor. Always return valid JSON only. No markdown, no explanation, just the JSON object."}]
+        },
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ],
+        "generationConfig": {
+            "temperature": 0.1
+        }
+    }
+
+    for model in models_to_try:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_api_key}"
+        for attempt in range(retries):
+            try:
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+
+                if resp.status_code == 429:
+                    wait = base_delay * (2 ** attempt)
+                    print(f"[{model}] Rate limited (429). Waiting {wait}s before retry {attempt + 1}/{retries}...")
+                    time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE).strip()
+                result = json.loads(raw)
+                print(f"Success with model: {model}")
+                return result
+
+            except requests.exceptions.HTTPError as e:
+                print(f"[{model}] Attempt {attempt + 1} HTTP error: {e}")
+                if attempt < retries - 1:
+                    time.sleep(base_delay)
+            except Exception as e:
+                print(f"[{model}] Attempt {attempt + 1} failed: {e}")
+                if attempt < retries - 1:
+                    time.sleep(base_delay)
+
+        print(f"[{model}] All {retries} attempts failed, trying next model...")
+
+    print("All models exhausted. Exiting gracefully.")
+    exit(0)
+
+result = call_gemini(prompt)
+
+title_keyword = result.get("issue_title", "")[:40]
+if was_already_closed(title_keyword):
+    exit(0)
+
+affected_file = result.get("affected_file", "")
+affected_line = result.get("affected_line", 1)
+
+if affected_file:
+    permalink = build_permalink(affected_file, affected_line)
+    issue_body = result["issue_body"].replace("PUT_PERMALINK_HERE", permalink)
+else:
+    issue_body = result["issue_body"].replace("PUT_PERMALINK_HERE", "_No specific file identified_")
+
+if event_name == "push":
+    footer = f"\n\n---\n*Generated automatically from commit {os.environ.get('COMMIT_SHA')[:7]}*"
+else:
+    footer = f"\n\n---\n*Generated automatically from {dedup_key}*"
+
+severity = result.get("severity", "medium").lower()
+severity_label_map = {
+    "critical": "severity: critical",
+    "high":     "severity: high",
+    "medium":   "severity: medium",
+    "low":      "severity: low",
+}
+extra_labels = [severity_label_map.get(severity, "severity: medium")]
+all_labels = list(set(result.get("labels", []) + extra_labels))
+
+print(f"[6/6] Creating issue...")
+issue = repo.create_issue(
+    title=result["issue_title"],
+    body=issue_body + footer,
+    labels=all_labels
+)
+print(f"Created issue #{issue.number}: {issue.title}")
+
+if pr_ref:
+    summary = result.get("summary", "")
+    if summary:
+        pr_comment = (
+            f"### 🤖 AI Analysis Summary\n\n"
+            f"{summary}\n\n"
+            f"**Severity:** `{severity.upper()}`\n\n"
+            f"📋 Full details: #{issue.number}"
+        )
+        pr_ref.create_issue_comment(pr_comment)
+        print(f"Posted summary comment to PR #{pr_ref.number}")
