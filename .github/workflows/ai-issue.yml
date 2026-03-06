@@ -1,4 +1,4 @@
-name: Gemeni Auto-Issue Generator
+name: Gemini Auto-Issue Generator
 
 on:
   push:
@@ -16,11 +16,11 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4 # Исправлено с v6 на v4
         with:
           fetch-depth: 2
       
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5 # Исправлено с v6 на v5
         with:
           python-version: '3.11'
           
