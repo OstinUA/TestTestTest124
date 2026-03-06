@@ -1,158 +1,267 @@
 import os
 import json
+import re
+import time
 import requests
 from github import Github, Auth
 
-# 1. Получаем переменные окружения и проверяем, что они существуют
+print("=== Запуск умного генератора Issue ===")
+
 gh_token = os.environ.get("GITHUB_TOKEN")
-gemini_key = os.environ.get("GEMINI_API_KEY")
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
 repo_name = os.environ.get("REPOSITORY")
 event_name = os.environ.get("EVENT_NAME")
-raw_allowed_user = os.environ.get("ALLOWED_USER")
+allowed_users = [u.strip().lower() for u in os.environ.get("ALLOWED_USER", "").split(",")]
 
-print("=== Запуск скрипта генерации Issue ===")
-
-if not raw_allowed_user:
-    print("❌ Ошибка: Секрет ALLOWED_USER не задан!")
-    exit(1)
-
-allowed_user = raw_allowed_user.strip().lower()
-
-# 2. Подключаемся к GitHub
-print(f"Подключение к репозиторию: {repo_name}")
+print(f"[1/6] Подключение к GitHub...")
 auth = Auth.Token(gh_token)
-gh = Github(auth=auth)
+gh = Github(auth=auth, timeout=30, retry=3)
+
+print(f"[2/6] Получение репозитория: {repo_name}")
 repo = gh.get_repo(repo_name)
 
 diff_text = ""
 event_context = ""
 author_login = ""
+trigger_labels = []
+dedup_key = ""
+pr_ref = None
 
-# 3. Обрабатываем событие (Push или Pull Request)
-print(f"Событие триггера: {event_name}")
-
+print(f"[3/6] Обработка события: {event_name}")
 if event_name == "push":
     commit_sha = os.environ.get("COMMIT_SHA")
-    print(f"Анализируем коммит: {commit_sha}")
+    print(f"[3/6] Анализ коммита: {commit_sha[:7]}")
     commit = repo.get_commit(commit_sha)
-    
+
+    if len(commit.parents) > 1:
+        print("⏭️ ПРОПУСК: Это Merge commit (слияние веток).")
+        exit(0)
     if not commit.author:
-        print("⚠️ Не удалось определить автора коммита. Выход.")
+        print("⏭️ ПРОПУСК: Не удалось определить автора коммита.")
         exit(0)
-        
+
     author_login = commit.author.login.strip().lower()
-    print(f"Автор: {author_login}, Разрешенный пользователь: {allowed_user}")
-    
-    if author_login != allowed_user:
-        print("⚠️ Автор коммита не совпадает с ALLOWED_USER. Выход.")
+    if author_login not in allowed_users:
+        print(f"⏭️ ПРОПУСК: Автор '{author_login}' не в списке разрешенных.")
         exit(0)
-        
+
+    dedup_key = f"commit:{commit_sha[:7]}"
     event_context = f"Commit Message: {commit.commit.message}"
-    
-    # Собираем изменения кода
+    trigger_labels = [m.lower() for m in re.findall(r'\[(.*?)\]', commit.commit.message)]
+    print(f"[3/6] Найденные метки в сообщении: {trigger_labels}")
+
     for file in commit.files:
         diff_text += f"File: {file.filename}\nPatch:\n{file.patch}\n\n"
-        if len(diff_text) > 100000:
-            diff_text += "\n[Diff too large, truncated...]"
+        if len(diff_text) > 10000:
+            diff_text += "\n[Diff truncated...]"
             break
-            
+
 elif event_name == "pull_request":
     pr_number = int(os.environ.get("PR_NUMBER"))
-    print(f"Анализируем Pull Request: #{pr_number}")
+    print(f"[3/6] Анализ PR: #{pr_number}")
     pr = repo.get_pull(pr_number)
     author_login = pr.user.login.strip().lower()
-    
-    print(f"Автор PR: {author_login}, Разрешенный пользователь: {allowed_user}")
-    if author_login != allowed_user:
-        print("⚠️ Автор PR не совпадает с ALLOWED_USER. Выход.")
+    if author_login not in allowed_users:
+        print(f"⏭️ ПРОПУСК: Автор '{author_login}' не в списке разрешенных.")
         exit(0)
-        
+
+    pr_ref = pr
+    dedup_key = f"PR #{pr_number}"
     event_context = f"PR Title: {pr.title}\nPR Body: {pr.body}"
+    trigger_labels = [label.name.lower() for label in pr.labels]
+    print(f"[3/6] Найденные метки PR: {trigger_labels}")
+
     for file in pr.get_files():
         diff_text += f"File: {file.filename}\nPatch:\n{file.patch}\n\n"
-        if len(diff_text) > 100000:
-            diff_text += "\n[Diff too large, truncated...]"
+        if len(diff_text) > 80000:
+            diff_text += "\n[Diff truncated...]"
             break
 else:
-    print(f"⚠️ Неизвестное событие {event_name}. Скрипт обрабатывает только push и pull_request.")
+    print(f"⏭️ ПРОПУСК: Неизвестное событие '{event_name}'.")
     exit(0)
 
-print(f"Собрано {len(diff_text)} символов изменений кода.")
+print(f"[4/6] Размер изменений кода: {len(diff_text)} символов")
+if len(diff_text.strip()) < 50:
+    print("⏭️ ПРОПУСК: Изменений слишком мало для анализа (менее 50 символов).")
+    exit(0)
 
-# 4. Подготовка промпта для нейросети
-prompt = f"""
-Analyze the following code changes and create a detailed description for a GitHub Issue.
-IMPORTANT: The issue_title and issue_body MUST be written entirely in English.
+print(f"[4/6] Проверка на наличие дубликатов...")
+for issue in repo.get_issues(state="open"):
+    if dedup_key in (issue.body or ""):
+        print(f"⏭️ ПРОПУСК: Issue для {dedup_key} уже существует (#{issue.number}).")
+        exit(0)
 
-Context:
-{event_context}
+def was_already_closed(title_keyword: str) -> bool:
+    for issue in repo.get_issues(state="closed"):
+        if title_keyword.lower() in (issue.title or "").lower():
+            print(f"⏭️ ПРОПУСК: Похожее Issue уже было закрыто ранее (#{issue.number}).")
+            return True
+    return False
 
-Code Changes:
-{diff_text}
+def build_permalink(filename: str, line: int = 1) -> str:
+    sha = os.environ.get("COMMIT_SHA") or ""
+    if not sha and pr_ref:
+        sha = pr_ref.head.sha
+    return f"https://github.com/{repo_name}/blob/{sha}/{filename}#L{line}"
 
-Instructions:
-1. Create a clear issue title and body explaining the changes or implementation details in English.
-2. Choose the most appropriate labels from: ["bug", "documentation", "duplicate", "enhancement", "good first issue", "help wanted", "invalid", "question", "wontfix"].
-3. SECURITY REVIEW: Carefully analyze the code changes for any potential security vulnerabilities (e.g., injection flaws, hardcoded secrets, XSS, insecure data handling).
-   - If you find a potential vulnerability, add a section "### Security Warning" at the end of the `issue_body` describing the risk and how to fix it in English.
-   - Also, if a vulnerability is found, add the label "security" to the `labels` list.
+base_instructions = """
+Return only a raw JSON object with no markdown formatting. The JSON must have these exact keys:
 
-Return only a raw JSON object with no markdown formatting. The JSON must contain these exact keys:
-"issue_title": string,
-"issue_body": string,
-"labels": list of strings
+"issue_title": string — include severity prefix like [CRITICAL], [HIGH], [MEDIUM], or [LOW] at the start,
+"severity": string — one of: critical, high, medium, low,
+"issue_body": string — must include these sections:
+  ## Problem
+  (clear description with exact file paths and line numbers if known)
+
+  ## Code Reference
+  (the exact problematic code snippet)
+
+  ## Suggested Fix
+  (concrete code or steps to fix)
+
+  ## Permalink
+  (placeholder: PUT_PERMALINK_HERE — will be replaced automatically)
+
+"labels": list of strings — standard GitHub labels plus the severity level,
+"affected_file": string — the most relevant filename from the diff (or "" if unknown),
+"affected_line": integer — approximate line number of the issue (or 1 if unknown),
+"summary": string — 2-3 sentence plain-English summary for the PR comment
+
+The issue_title, issue_body and summary MUST be written entirely in English.
 """
 
-# ИСПРАВЛЕНИЕ: Используем правильную версию модели
-model_name = "gemini-2.0-flash" 
-api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-payload = {"contents": [{"parts": [{"text": prompt}]}]}
-headers = {"Content-Type": "application/json"}
+if any(l in trigger_labels for l in ["sec", "security", "audit"]):
+    prompt = f"Act as a Strict Security Auditor. Perform a deep security audit (OWASP Top 10). Find real vulnerabilities with exact file/line references.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["review", "refactor", "code-review"]):
+    prompt = f"Act as a Strict Code Reviewer. Analyze code quality (SOLID/DRY). Point to exact lines that violate principles.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["qa", "test", "testing"]):
+    prompt = f"Act as a QA Engineer. Identify edge cases and missing test coverage. Reference exact functions/lines.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["perf", "performance", "optimize"]):
+    prompt = f"Act as a Performance Expert. Analyze bottlenecks and O(n) complexity issues with exact line references.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["pm", "release", "product"]):
+    prompt = f"Act as a Product Manager. Generate user-facing Release Notes with clear impact descriptions.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["deps", "dependencies"]):
+    prompt = f"Act as a Security & Dependency Auditor. Analyze all new or changed dependencies: check for known vulnerabilities (CVEs), license compatibility (MIT/Apache/GPL), package size impact, and whether each dep is actively maintained. Reference exact file and line where dep is added.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+elif any(l in trigger_labels for l in ["arch", "architecture"]):
+    prompt = f"Act as a Software Architect. Review the code changes for architectural issues: violation of separation of concerns, tight coupling, wrong layer dependencies, anti-patterns (God object, spaghetti logic, magic numbers). Reference exact files and lines.\nContext: {event_context}\nChanges: {diff_text}\n{base_instructions}"
+else:
+    prompt = f"""Analyze the following code changes and create a documentation issue summarizing what was changed and why.
+IMPORTANT: Do NOT invent security issues, bugs, or problems that do not exist in the diff.
+If the changes are trivial (e.g. adding imports, minor refactoring), set severity to LOW and describe only what actually changed.
+Context: {event_context}
+Changes: {diff_text}
+{base_instructions}"""
 
-print(f"Отправка запроса к Gemini API (модель: {model_name})...")
+print(f"[5/6] Отправка запроса к Gemini API...")
+def call_gemini(prompt: str, retries: int = 4, base_delay: int = 15) -> dict:
+    headers = {"Content-Type": "application/json"}
+    models_to_try = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+    ]
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": "You are a professional software auditor. Always return valid JSON only. No markdown, no explanation, just the JSON object."}]
+        },
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ],
+        "generationConfig": {
+            "temperature": 0.1
+        }
+    }
 
-# ИСПРАВЛЕНИЕ: Добавили обработку ошибок и timeout=30 (ждать ответа не больше 30 секунд)
-try:
-    resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status() # Проверяем, не вернул ли сервер ошибку (например, 403 или 404)
-    resp_data = resp.json()
-except Exception as e:
-    print(f"❌ Ошибка при обращении к API Gemini: {e}")
-    print(f"Ответ сервера: {resp.text}")
-    exit(1)
+    for model in models_to_try:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_api_key}"
+        for attempt in range(retries):
+            try:
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
 
-print("Ответ от Gemini успешно получен. Обработка текста...")
+                if resp.status_code == 429:
+                    wait = base_delay * (2 ** attempt)
+                    print(f"⏳ [{model}] Лимит API. Ждем {wait}с (попытка {attempt + 1}/{retries})...")
+                    time.sleep(wait)
+                    continue
 
-try:
-    response_text = resp_data['candidates'][0]['content']['parts'][0]['text'].strip()
-    
-    # Очистка текста от маркдауна ```json ... ```
-    if response_text.startswith("```json"):
-        response_text = response_text[7:]
-    elif response_text.startswith("```"):
-        response_text = response_text[3:]
-        
-    if response_text.endswith("```"):
-        response_text = response_text[:-3]
-        
-    response_text = response_text.strip()
-    result = json.loads(response_text)
-except Exception as e:
-    print(f"❌ Ошибка при чтении JSON от Gemini: {e}")
-    print(f"Что вернула нейросеть: {resp_data}")
-    exit(1)
+                resp.raise_for_status()
+                data = resp.json()
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE).strip()
+                result = json.loads(raw)
+                print(f"✅ Успешный ответ от модели: {model}")
+                return result
 
-# 5. Создание Issue
+            except requests.exceptions.HTTPError as e:
+                print(f"❌ [{model}] Ошибка сети (Попытка {attempt + 1}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(base_delay)
+            except Exception as e:
+                print(f"❌ [{model}] Ошибка обработки (Попытка {attempt + 1}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(base_delay)
+
+        print(f"⚠️ [{model}] Все {retries} попытки исчерпаны, пробуем следующую модель...")
+
+    print("Критическая ошибка: ни одна модель не смогла дать ответ. Завершение.")
+    exit(1) # Завершаем с кодом 1, чтобы в GitHub загорелся красный крестик при реальной ошибке
+
+result = call_gemini(prompt)
+
+title_keyword = result.get("issue_title", "")[:40]
+if was_already_closed(title_keyword):
+    exit(0)
+
+affected_file = result.get("affected_file", "")
+affected_line = result.get("affected_line", 1)
+
+if affected_file:
+    permalink = build_permalink(affected_file, affected_line)
+    issue_body = result["issue_body"].replace("PUT_PERMALINK_HERE", permalink)
+else:
+    issue_body = result["issue_body"].replace("PUT_PERMALINK_HERE", "_No specific file identified_")
+
 if event_name == "push":
     footer = f"\n\n---\n*Generated automatically from commit {os.environ.get('COMMIT_SHA')[:7]}*"
 else:
-    footer = f"\n\n---\n*Generated automatically from PR #{os.environ.get('PR_NUMBER')}*"
+    footer = f"\n\n---\n*Generated automatically from {dedup_key}*"
 
-print("Создание Issue в GitHub...")
-issue = repo.create_issue(
-    title=result['issue_title'],
-    body=result['issue_body'] + footer,
-    labels=result.get('labels', [])
-)
+severity = result.get("severity", "medium").lower()
+severity_label_map = {
+    "critical": "severity: critical",
+    "high":     "severity: high",
+    "medium":   "severity: medium",
+    "low":      "severity: low",
+}
+extra_labels = [severity_label_map.get(severity, "severity: medium")]
+all_labels = list(set(result.get("labels", []) + extra_labels))
 
-print(f"✅ Успешно! Создано Issue #{issue.number}: {issue.title}")
+print(f"[6/6] Создание Issue в GitHub...")
+try:
+    issue = repo.create_issue(
+        title=result["issue_title"],
+        body=issue_body + footer,
+        labels=all_labels
+    )
+    print(f"🎉 Готово! Создано issue #{issue.number}: {issue.title}")
+except Exception as e:
+    print(f"❌ Ошибка при создании Issue в GitHub (возможно нет прав на метки): {e}")
+    # Если упало из-за меток, пробуем создать без них
+    print("Пробуем создать Issue без кастомных меток...")
+    issue = repo.create_issue(
+        title=result["issue_title"],
+        body=issue_body + footer
+    )
+    print(f"🎉 Готово (без меток)! Создано issue #{issue.number}: {issue.title}")
+
+if pr_ref:
+    summary = result.get("summary", "")
+    if summary:
+        pr_comment = (
+            f"### 🤖 AI Analysis Summary\n\n"
+            f"{summary}\n\n"
+            f"**Severity:** `{severity.upper()}`\n\n"
+            f"📋 Full details: #{issue.number}"
+        )
+        pr_ref.create_issue_comment(pr_comment)
+        print(f"Комментарий оставлен к PR #{pr_ref.number}")
